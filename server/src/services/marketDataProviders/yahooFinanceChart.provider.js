@@ -1,7 +1,9 @@
 import axios from "axios";
 
 const endpoint = "https://query1.finance.yahoo.com/v8/finance/chart";
+const alphaEndpoint = "https://www.alphavantage.co/query";
 const exchangeTimeZone = "Asia/Kolkata";
+const alphaApiKey = process.env.STOCK_API_KEY || "";
 let requestQueue = Promise.resolve();
 let nextRequestAt = 0;
 
@@ -21,9 +23,19 @@ function numberOrNull(value) {
   return Number.isFinite(valueAsNumber) ? valueAsNumber : null;
 }
 
+function parsePercent(value) {
+  const parsed = numberOrNull(String(value || "").replace(/%/g, ""));
+  return parsed;
+}
+
 function providerSymbol(symbol) {
   const normalized = String(symbol).trim().toUpperCase();
   return normalized.endsWith(".NS") ? normalized : `${normalized}.NS`;
+}
+
+function alphaTicker(symbol) {
+  const normalized = String(symbol).trim().toUpperCase().replace(/\.NS$/, "");
+  return `NSE:${normalized}`;
 }
 
 async function pacedGet(symbol, params) {
@@ -134,7 +146,117 @@ function marketStatus(meta, quoteTimestamp) {
   return { status: "unknown", label: "Status unavailable", isOpen: null, basis: "provider did not report market state" };
 }
 
+async function fetchAlphaVantageQuote(symbol) {
+  const response = await axios.get(alphaEndpoint, {
+    params: {
+      function: "GLOBAL_QUOTE",
+      symbol: alphaTicker(symbol),
+      apikey: alphaApiKey
+    },
+    timeout: 10000
+  });
+
+  const quote = response.data?.["Global Quote"] || {};
+  if (!Object.keys(quote).length) {
+    throw new MarketDataProviderError("Alpha Vantage returned no market data for this symbol.", { code: "NO_DATA", status: 404 });
+  }
+
+  const price = numberOrNull(quote["05. price"]);
+  const previousClose = numberOrNull(quote["08. previous close"]);
+  const change = numberOrNull(quote["09. change"]);
+  const changePercent = parsePercent(quote["10. change percent"]);
+  const latestDate = quote["07. latest trading day"];
+  const quoteTimestamp = latestDate ? new Date(`${latestDate}T15:30:00+05:30`).toISOString() : null;
+
+  if (price === null) {
+    throw new MarketDataProviderError("Alpha Vantage did not return a current quote.", { code: "NO_DATA", status: 404 });
+  }
+
+  return {
+    symbol: String(symbol).trim().toUpperCase(),
+    providerSymbol: alphaTicker(symbol),
+    source: "Alpha Vantage",
+    currency: "INR",
+    currentPrice: price,
+    previousClose,
+    change,
+    changePercent,
+    dayOpen: numberOrNull(quote["02. open"]),
+    dayHigh: numberOrNull(quote["03. high"]),
+    dayLow: numberOrNull(quote["04. low"]),
+    volume: numberOrNull(quote["06. volume"]),
+    fiftyTwoWeekHigh: null,
+    fiftyTwoWeekLow: null,
+    marketStatus: { status: "unknown", label: "Status unavailable", isOpen: null, basis: "Alpha Vantage quote feed" },
+    lastUpdated: quoteTimestamp,
+    fetchedAt: new Date().toISOString(),
+    disclaimer: "Current quote data comes from Alpha Vantage free-tier access. Use only for educational demo work."
+  };
+}
+
+async function fetchAlphaVantageCandles(symbol, requestedInterval) {
+  const intervalMap = {
+    "5m": { function: "TIME_SERIES_INTRADAY", interval: "5min" },
+    "15m": { function: "TIME_SERIES_INTRADAY", interval: "15min" },
+    "1h": { function: "TIME_SERIES_INTRADAY", interval: "60min" },
+    "1d": { function: "TIME_SERIES_DAILY", interval: null }
+  };
+  const selected = intervalMap[requestedInterval];
+  if (!selected) throw new MarketDataProviderError("Unsupported candle interval.", { code: "INVALID_INTERVAL", status: 400 });
+
+  const response = await axios.get(alphaEndpoint, {
+    params: {
+      function: selected.function,
+      symbol: alphaTicker(symbol),
+      interval: selected.interval,
+      outputsize: "compact",
+      apikey: alphaApiKey
+    },
+    timeout: 10000
+  });
+
+  const seriesKey = selected.function === "TIME_SERIES_DAILY" ? "Time Series (Daily)" : `Time Series (${selected.interval})`;
+  const series = response.data?.[seriesKey] || {};
+  const candles = Object.entries(series)
+    .map(([timestamp, values]) => ({
+      timestamp: new Date(`${timestamp}T15:30:00+05:30`).toISOString(),
+      open: numberOrNull(values["1. open"]),
+      high: numberOrNull(values["2. high"]),
+      low: numberOrNull(values["3. low"]),
+      close: numberOrNull(values["4. close"]),
+      volume: numberOrNull(values["5. volume"])
+    }))
+    .filter(item => [item.open, item.high, item.low, item.close].every(value => value !== null))
+    .slice(0, 200)
+    .reverse();
+
+  if (!candles.length) {
+    throw new MarketDataProviderError("No candles are available for this symbol in the Alpha Vantage feed.", { code: "NO_DATA", status: 404 });
+  }
+
+  return {
+    symbol: String(symbol).trim().toUpperCase(),
+    providerSymbol: alphaTicker(symbol),
+    source: "Alpha Vantage",
+    interval: requestedInterval,
+    currency: "INR",
+    candles,
+    fetchedAt: new Date().toISOString(),
+    disclaimer: "Intraday candles are from the free-tier Alpha Vantage feed. Use only for educational demo work."
+  };
+}
+
 export async function fetchQuote(symbol) {
+  if (alphaApiKey) {
+    try {
+      return await fetchAlphaVantageQuote(symbol);
+    } catch (error) {
+      if (error instanceof MarketDataProviderError) {
+        throw error;
+      }
+    }
+  }
+
   const result = await fetchChart(symbol, "1d", "5d");
   const meta = result.meta || {};
   const last = lastValidCandle(result);
@@ -181,6 +303,16 @@ const candleIntervals = {
 export const supportedIntervals = Object.keys(candleIntervals);
 
 export async function fetchCandles(symbol, requestedInterval) {
+  if (alphaApiKey) {
+    try {
+      return await fetchAlphaVantageCandles(symbol, requestedInterval);
+    } catch (error) {
+      if (error instanceof MarketDataProviderError) {
+        throw error;
+      }
+    }
+  }
+
   const config = candleIntervals[requestedInterval];
   if (!config) throw new MarketDataProviderError("Unsupported candle interval.", { code: "INVALID_INTERVAL", status: 400 });
 

@@ -60,7 +60,7 @@ function Layout({ children }) {
   const [marketStatus, setMarketStatus] = useState(getMarketStatus);
   const searchInput = useRef(null);
 
-  useEffect(() => { api.get("/stocks").then(({ data }) => setUniverse(data.data || [])).catch(() => {}); }, []);
+  useEffect(() => { api.get("/stocks").then(({ data }) => setUniverse(data.data || [])).catch(() => { }); }, []);
   useEffect(() => {
     const timer = window.setInterval(() => setMarketStatus(getMarketStatus()), 60_000);
     return () => window.clearInterval(timer);
